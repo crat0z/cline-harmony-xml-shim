@@ -415,7 +415,7 @@ def detect_mode(messages: List[Dict[str, Any]]) -> str:
 # ---------- app ----------
 def create_app(cfg):
     app = FastAPI()
-    log = logging.getLogger("cline-xml-shim")
+    log = logging.getLogger("cline-harmony-xml-shim")
 
     # load aliases once
     load_custom_aliases(cfg.custom_aliases_json, log)
@@ -528,7 +528,7 @@ def create_app(cfg):
 
         # known canonical
         if known and canonical in KNOWN:
-            return tool_to_xml_direct(canonical, args_json, logging.getLogger("cline-xml-shim"), order), True
+            return tool_to_xml_direct(canonical, args_json, logging.getLogger("cline-harmony-xml-shim"), order), True
 
         # browser-ish heuristic only if default server provided
         if cfg.default_mcp_server and looks_browsery(name):
@@ -544,7 +544,7 @@ def create_app(cfg):
             return "", False
 
         # Literal fallback: emit a tag with same name (may fail on Cline)
-        xml = tool_to_xml_direct(name, args_json, logging.getLogger("cline-xml-shim"), order)
+        xml = tool_to_xml_direct(name, args_json, logging.getLogger("cline-harmony-xml-shim"), order)
         return xml, True
 
     # ---------- non-streaming path ----------
@@ -554,7 +554,7 @@ def create_app(cfg):
         try:
             j = r.json()
         except Exception as e:
-            logging.getLogger("cline-xml-shim").error("Upstream non-stream JSON decode error: %s", e)
+            logging.getLogger("cline-harmony-xml-shim").error("Upstream non-stream JSON decode error: %s", e)
             return JSONResponse({"error":"bad_upstream_json"}, status_code=502)
 
         if not j.get("choices"):
@@ -590,7 +590,7 @@ def create_app(cfg):
                 if not ok:
                     # strict: synth question
                     xml = f"<ask_followup_question><question>Unknown tool '{xml_escape(name)}' in this context. Please use one of the documented tools.</question></ask_followup_question>"
-                    logging.getLogger("cline-xml-shim").error("Unknown tool '%s'; synthesized follow-up.", name)
+                    logging.getLogger("cline-harmony-xml-shim").error("Unknown tool '%s'; synthesized follow-up.", name)
                 xml_parts.append(xml)
 
             content = (msg.get("content") or "") + "".join(xml_parts)
@@ -603,7 +603,7 @@ def create_app(cfg):
     # ---------- streaming path ----------
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
-        log = logging.getLogger("cline-xml-shim")
+        log = logging.getLogger("cline-harmony-xml-shim")
         try:
             body = await req.json()
         except Exception:
@@ -907,7 +907,7 @@ def create_app(cfg):
 if __name__ == "__main__":
     args = parse_args()
     setup_logging(args.log_level)
-    log = logging.getLogger("cline-xml-shim")
+    log = logging.getLogger("cline-harmony-xml-shim")
 
     class Cfg:
         upstream = args.upstream.rstrip("/")
