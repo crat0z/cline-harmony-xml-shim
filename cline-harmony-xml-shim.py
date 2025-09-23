@@ -180,16 +180,58 @@ def normalize_name(name: str) -> Tuple[str,bool]:
     return name, (name in KNOWN)
 
 def dict_from_overrides(s: str) -> Dict[str, Any]:
+    """
+    Accepts either:
+      - a JSON object string: '{"temperature":0.3,"stream":true}'
+      - or a comma-separated list: 'temperature=0.3,top_k=48,stream=true'
+    Parsing precedence for values: JSON -> bool -> null/none -> int -> float -> string
+    """
+    s = (s or "").strip()
+    if not s:
+        return {}
+
+    # 1) If it looks like a JSON object, parse and return directly
+    if s[0] == "{":
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass  # fall through to k=v parsing
+
+    def parse_scalar(v: str) -> Any:
+        v = v.strip()
+        # If the value itself is JSON (array/object/string literal), try that first
+        if v and v[0] in '[{"\'':
+            try:
+                return json.loads(v)
+            except Exception:
+                pass
+        lv = v.lower()
+        if lv == "true": return True
+        if lv == "false": return False
+        if lv in ("null", "none"): return None
+        if re.fullmatch(r"[+-]?\d+", v):
+            try:
+                return int(v)
+            except Exception:
+                pass
+        # float (supports scientific notation)
+        if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?", v):
+            try:
+                return float(v)
+            except Exception:
+                pass
+        return v  # fallback: string
+
     out: Dict[str, Any] = {}
     for part in filter(None, [p.strip() for p in s.split(",")]):
-        if "=" in part:
-            k,v = part.split("=",1)
-            k = k.strip(); v = v.strip()
-            try:
-                out[k] = int(v) if re.fullmatch(r"[+-]?\d+", v) else float(v)
-            except ValueError:
-                out[k] = v
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        out[k.strip()] = parse_scalar(v)
     return out
+
 
 def content_to_text(m_content: Any) -> str:
     # OpenAI style can be str or list of {type,text|image_url|...}
