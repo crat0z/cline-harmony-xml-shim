@@ -70,6 +70,7 @@ FLUSH_BYTES            = int(ENV("FLUSH_BYTES", "256"))
 # SSE tees
 DUMP_UPSTREAM          = ENV("DUMP_UPSTREAM", "")
 DUMP_DOWNSTREAM        = ENV("DUMP_DOWNSTREAM", "")
+CACHE_REUSE            = ENV("CACHE_REUSE", "0") == "1"
 
 # ---------- argparse (CLI overrides env) ----------
 def parse_args():
@@ -110,6 +111,17 @@ def parse_args():
     p.add_argument("--enforce-xml", choices=["off","plan","act","both"], default=ENFORCE_XML, help="Attach a minimal XML grammar (experimental)")
     # streaming
     p.add_argument("--flush-bytes", type=int, default=FLUSH_BYTES, help="Flush text buffer when >= N bytes or newline")
+
+    # caching / reasoning effort
+    p.add_argument("--cache-reuse", action="store_true", default=CACHE_REUSE,
+                   help="Enable cache_prompt=true on every request (default: off).")
+    p.add_argument("--reasoning-effort", choices=["low","medium","high"], default=None,
+                   help="Global reasoning.effort override.")
+    p.add_argument("--reasoning-effort-plan", choices=["low","medium","high"], default=None,
+                   help="PLAN-mode reasoning.effort (overrides global if set).")
+    p.add_argument("--reasoning-effort-act", choices=["low","medium","high"], default=None,
+                   help="ACT-mode reasoning.effort (overrides global if set).")
+
     return p.parse_args()
 
 # ---------- logging ----------
@@ -428,6 +440,24 @@ def create_app(cfg):
         # Mode detection
         mode = detect_mode(upstream_body.get("messages", []))
 
+        def effort_for(mode: str) -> Optional[str]:
+            # Per-mode takes precedence; if both unset, return None (= do not set)
+            if mode == "PLAN" and cfg.reasoning_effort_plan:
+                return cfg.reasoning_effort_plan
+            if mode == "ACT" and cfg.reasoning_effort_act:
+                return cfg.reasoning_effort_act
+            return cfg.reasoning_effort  # may be None
+
+        eff = effort_for(mode)
+        if eff:
+            upstream_body["reasoning_effort"] = eff
+
+        if cfg.cache_reuse:
+            upstream_body["cache_prompt"] = True
+        
+        ctx["effort"] = eff
+        ctx["cache_prompt"] = cfg.cache_reuse
+
         # Sampling policy
         eff_sampling = {}
         if cfg.strip_client_sampling:
@@ -466,7 +496,16 @@ def create_app(cfg):
         ctx["effective_sampling"] = eff_sampling
 
         if cfg.log_body and log.isEnabledFor(logging.DEBUG):
-            log.debug(">>> Upstream request: %s", json.dumps({k: (upstream_body[k] if k!="messages" else "[messages elided]") for k in upstream_body}, ensure_ascii=False)[:2000])
+            snap = {k: (upstream_body[k] if k != "messages" else "[messages elided]")
+                    for k in upstream_body}
+            # enrich snapshot with useful derived info
+            snap["_ctx"] = {
+                "mode": ctx.get("mode"),
+                "cache_prompt": ctx.get("cache_prompt", False),
+                "reasoning_effort": ctx.get("effort"),
+                "effective_sampling": ctx.get("effective_sampling", {}),
+            }
+            log.debug(">>> Upstream request: %s", json.dumps(snap, ensure_ascii=False)[:2000])
 
         async with httpx.AsyncClient(timeout=None) as client:
             r = await client.post(f"{cfg.upstream}/v1/chat/completions", json=upstream_body)
@@ -841,12 +880,14 @@ def create_app(cfg):
                 # Turn summary
                 try:
                     log.info(
-                        "Turn summary | mode=%s sampling=%s tools_injected=%s converted_xml=%s content_emitted=%s",
+                        "Turn summary | mode=%s sampling=%s tools_injected=%s converted_xml=%s content_emitted=%s cache_prompt=%s reasoning_effort=%s",
                         ctx.get("mode","?"),
                         ctx.get("effective_sampling", {}),
                         bool(ctx.get("tool_specs")),
                         emitted_xml_tools,
-                        sent_any_content
+                        sent_any_content,
+                        bool(ctx.get("cache_prompt", False)),
+                        ctx.get("effort")
                     )
                 except Exception:
                     pass
@@ -904,6 +945,12 @@ if __name__ == "__main__":
 
         dump_upstream = args.dump_upstream
         dump_downstream = args.dump_downstream
+
+        cache_reuse = args.cache_reuse
+
+        reasoning_effort = args.reasoning_effort
+        reasoning_effort_plan = args.reasoning_effort_plan
+        reasoning_effort_act = args.reasoning_effort_act
 
     app = create_app(Cfg)
 
