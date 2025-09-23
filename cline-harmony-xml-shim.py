@@ -57,7 +57,7 @@ SYNTH_EMPTY_XML        = ENV("SYNTHESIZE_EMPTY_XML", "1") == "1"  # default ON
 PROMOTE_REASONING      = ENV("PROMOTE_REASONING_IF_EMPTY", "0") == "1"
 FALLBACK_QUESTION      = ENV("FALLBACK_QUESTION", "The model returned no actionable content this turn. Would you like me to try again or ask a follow-up question?")
 
-STRIP_CLIENT_SAMPLING  = ENV("STRIP_CLIENT_SAMPLING", "0") == "1"
+STRIP_CLIENT_SAMPLING  = ENV("STRIP_CLIENT_SAMPLING", "1") == "1"
 SET_SAMPLING           = ENV("SET_SAMPLING", "")         # "temperature=0.3,top_p=0.9,top_k=40"
 SET_SAMPLING_PLAN      = ENV("SET_SAMPLING_PLAN", "")    # per-mode overrides
 SET_SAMPLING_ACT       = ENV("SET_SAMPLING_ACT", "")
