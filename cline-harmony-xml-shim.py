@@ -70,7 +70,7 @@ FLUSH_BYTES            = int(ENV("FLUSH_BYTES", "256"))
 # SSE tees
 DUMP_UPSTREAM          = ENV("DUMP_UPSTREAM", "")
 DUMP_DOWNSTREAM        = ENV("DUMP_DOWNSTREAM", "")
-CACHE_REUSE            = ENV("CACHE_REUSE", "0") == "1"
+CACHE_REUSE            = ENV("CACHE_REUSE", "1") == "1"
 
 # ---------- argparse (CLI overrides env) ----------
 def parse_args():
@@ -102,7 +102,8 @@ def parse_args():
     p.add_argument("--promote-reasoning-if-empty", action="store_true", default=PROMOTE_REASONING, help="Promote reasoning_content to content if content empty")
     p.add_argument("--fallback-question", default=FALLBACK_QUESTION, help="Custom question text for synthesized <ask_followup_question>")
     # sampling
-    p.add_argument("--strip-client-sampling", action="store_true", default=STRIP_CLIENT_SAMPLING, help="Drop client temperature/top_p/top_k/etc.")
+    p.add_argument("--strip-client-sampling", action="store_true", default=STRIP_CLIENT_SAMPLING, help="Drop client temperature/top_p/top_k/etc. (default: on).")
+    p.add_argument("--no-strip-client-sampling", dest="strip_client_sampling", action="store_false", help="Disable client sampling parameters dropping for this run.")
     p.add_argument("--set-sampling", default=SET_SAMPLING, help='Global overrides, e.g. "temperature=0.3,top_p=0.9,top_k=40"')
     p.add_argument("--set-sampling-plan", default=SET_SAMPLING_PLAN, help='PLAN-mode overrides (take precedence)')
     p.add_argument("--set-sampling-act", default=SET_SAMPLING_ACT, help='ACT-mode overrides (take precedence)')
@@ -114,7 +115,9 @@ def parse_args():
 
     # caching / reasoning effort
     p.add_argument("--cache-reuse", action="store_true", default=CACHE_REUSE,
-                   help="Enable cache_prompt=true on every request (default: off).")
+                   help="Enable cache_prompt=true on every request (default: on).")
+    p.add_argument("--no-cache-reuse", dest="cache_reuse", action="store_false",
+                   help="Disable cache_prompt for this run.")
     p.add_argument("--reasoning-effort", choices=["low","medium","high"], default=None,
                    help="Global reasoning.effort override.")
     p.add_argument("--reasoning-effort-plan", choices=["low","medium","high"], default=None,
