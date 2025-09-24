@@ -65,7 +65,7 @@ SET_SAMPLING_ACT       = ENV("SET_SAMPLING_ACT", "")
 GUARDRAIL_PROMPT       = ENV("GUARDRAIL_PROMPT", "0") == "1"
 
 ENFORCE_XML            = ENV("ENFORCE_XML", "off")  # off|plan|act|both  (experimental)
-FLUSH_BYTES            = int(ENV("FLUSH_BYTES", "256"))
+FLUSH_BYTES            = int(ENV("FLUSH_BYTES", "0"))  # 0 -> flush every delta
 
 # SSE tees
 DUMP_UPSTREAM          = ENV("DUMP_UPSTREAM", "")
@@ -111,7 +111,7 @@ def parse_args():
     p.add_argument("--guardrail-prompt", action="store_true", default=GUARDRAIL_PROMPT, help="Insert a tiny system nudge after Cline system")
     p.add_argument("--enforce-xml", choices=["off","plan","act","both"], default=ENFORCE_XML, help="Attach a minimal XML grammar (experimental)")
     # streaming
-    p.add_argument("--flush-bytes", type=int, default=FLUSH_BYTES, help="Flush text buffer when >= N bytes or newline")
+    p.add_argument("--flush-bytes", type=int, default=FLUSH_BYTES, help="Flush text buffer when >= N bytes (0=every delta) or newline")
 
     # caching / reasoning effort
     p.add_argument("--cache-reuse", action="store_true", default=CACHE_REUSE,
@@ -420,7 +420,7 @@ def create_app(cfg):
     # load aliases once
     load_custom_aliases(cfg.custom_aliases_json, log)
 
-    async def upstream_post(payload: Dict[str, Any], ctx: Dict[str, Any]):
+    async def upstream_post(payload: Dict[str, Any], ctx: Dict[str, Any], stream: bool = False):
         upstream_body = dict(payload)
 
         # tool_choice handling
@@ -510,11 +510,26 @@ def create_app(cfg):
             }
             log.debug(">>> Upstream request: %s", json.dumps(snap, ensure_ascii=False)[:2000])
 
-        async with httpx.AsyncClient(timeout=None) as client:
-            r = await client.post(f"{cfg.upstream}/v1/chat/completions", json=upstream_body)
-            if cfg.trace_stream and upstream_body.get("stream"):
-                log.debug("STREAM open -> %s", r.status_code)
-            return r
+        client = httpx.AsyncClient(timeout=None)
+        try:
+            if stream:
+                request = client.build_request("POST", f"{cfg.upstream}/v1/chat/completions", json=upstream_body)
+                r = await client.send(request, stream=True)
+            else:
+                r = await client.post(f"{cfg.upstream}/v1/chat/completions", json=upstream_body)
+        except Exception:
+            await client.aclose()
+            raise
+
+        if cfg.trace_stream and upstream_body.get("stream"):
+            log.debug("STREAM open -> %s", r.status_code)
+
+        if stream:
+            ctx["_stream_client"] = client
+            ctx["_stream_response"] = r
+        else:
+            await client.aclose()
+        return r
 
     # Conversion helpers (use parsed spec if available)
     def convert_tool_call(native_name: str, args_json: str, tool_specs: Dict[str, Any]) -> Tuple[str, bool]:
@@ -619,7 +634,7 @@ def create_app(cfg):
 
         # streaming
         ctx: Dict[str, Any] = {}
-        up = await upstream_post(body, ctx)
+        up = await upstream_post(body, ctx, stream=True)
         id_ = f"chatcmpl-xmlshim-{int(time.time())}"
         model = body.get("model") or cfg.model
 
@@ -816,7 +831,7 @@ def create_app(cfg):
                     # capture reasoning (optional promotion at end)
                     if "reasoning_content" in d and d["reasoning_content"]:
                         if cfg.log_reasoning:
-                            log.debug("[reasoning Δ] %s", d["reasoning_content"])
+                            log.info("[reasoning Δ] %s", d["reasoning_content"])
                         reasoning_buf.append(d["reasoning_content"])
 
                     # native tool_calls (buffer by index)
@@ -843,7 +858,7 @@ def create_app(cfg):
                     # normal text deltas
                     if isinstance(d.get("content"), str) and d["content"]:
                         text_buf += d["content"]
-                        if len(text_buf) >= cfg.flush_bytes or "\n" in text_buf:
+                        if cfg.flush_bytes <= 0 or len(text_buf) >= cfg.flush_bytes or "\n" in text_buf:
                             if (c := flush_text()):
                                 yield send_line(f"data: {json.dumps(c)}\n\n")
 
@@ -878,6 +893,18 @@ def create_app(cfg):
                 yield send_line("data: [DONE]\n\n")
                 return
             finally:
+                stream_resp = ctx.pop("_stream_response", None)
+                if stream_resp:
+                    try:
+                        await stream_resp.aclose()
+                    except Exception:
+                        log.debug("Error closing upstream response", exc_info=True)
+                stream_client = ctx.pop("_stream_client", None)
+                if stream_client:
+                    try:
+                        await stream_client.aclose()
+                    except Exception:
+                        log.debug("Error closing upstream client", exc_info=True)
                 if up_fp: up_fp.close()
                 if down_fp: down_fp.close()
                 # Turn summary
