@@ -453,7 +453,7 @@ def create_app(cfg):
 
         eff = effort_for(mode)
         if eff:
-            upstream_body["reasoning_effort"] = eff
+            upstream_body.setdefault("chat_template_kwargs", {})["reasoning_effort"] = eff
 
         if cfg.cache_reuse:
             upstream_body["cache_prompt"] = True
