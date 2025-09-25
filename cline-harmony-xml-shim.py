@@ -642,6 +642,7 @@ def create_app(cfg):
         tool_buf: Dict[int, Dict[str, str]] = {}
         text_buf = ""
         reasoning_buf: List[str] = []
+        reasoning_stream = ""
         sent_any_content = False
         emitted_xml_tools = False
 
@@ -672,6 +673,18 @@ def create_app(cfg):
             }
             text_buf = ""
             sent_any_content = True
+            return chunk
+
+        def flush_reasoning():
+            nonlocal reasoning_stream
+            if not reasoning_stream:
+                return None
+            chunk = {
+                "id": id_, "object": "chat.completion.chunk",
+                "created": int(time.time()), "model": model,
+                "choices": [{ "index": 0, "delta": {"reasoning_content": reasoning_stream}, "finish_reason": None }],
+            }
+            reasoning_stream = ""
             return chunk
 
         def flush_tools():
@@ -780,7 +793,7 @@ def create_app(cfg):
             }
 
         async def gen():
-            nonlocal text_buf, tool_buf, sent_any_content, emitted_xml_tools, reasoning_buf
+            nonlocal text_buf, tool_buf, sent_any_content, emitted_xml_tools, reasoning_buf, reasoning_stream
 
             # Start with a role delta (helps strict SSE clients)
             head = {
@@ -801,6 +814,8 @@ def create_app(cfg):
 
                     if data == "[DONE]":
                         # finish: flush pending content/tools, then ensure not-empty
+                        if (c := flush_reasoning()):
+                            yield send_line(f"data: {json.dumps(c)}\n\n")
                         if (c := flush_text()):
                             yield send_line(f"data: {json.dumps(c)}\n\n")
                         if (c := flush_tools()):
@@ -833,6 +848,9 @@ def create_app(cfg):
                         if cfg.log_reasoning:
                             log.info("[reasoning Δ] %s", d["reasoning_content"])
                         reasoning_buf.append(d["reasoning_content"])
+                        reasoning_stream += d["reasoning_content"]
+                        if (c := flush_reasoning()):
+                            yield send_line(f"data: {json.dumps(c)}\n\n")
 
                     # native tool_calls (buffer by index)
                     if "tool_calls" in d and d["tool_calls"]:
@@ -849,6 +867,8 @@ def create_app(cfg):
 
                     # upstream signals tool_calls completed → emit converted XML
                     if ch0.get("finish_reason") in ("tool_calls", "tool_call"):
+                        if (c := flush_reasoning()):
+                            yield send_line(f"data: {json.dumps(c)}\n\n")
                         if (c := flush_text()):
                             yield send_line(f"data: {json.dumps(c)}\n\n")
                         if (c := flush_tools()):
@@ -864,6 +884,8 @@ def create_app(cfg):
 
                     # graceful stop mid-stream
                     if ch0.get("finish_reason") == "stop":
+                        if (c := flush_reasoning()):
+                            yield send_line(f"data: {json.dumps(c)}\n\n")
                         if (c := flush_text(mark_stop=True)):
                             yield send_line(f"data: {json.dumps(c)}\n\n")
                         elif not sent_any_content:
@@ -876,6 +898,8 @@ def create_app(cfg):
             except Exception as e:
                 log.error("Upstream stream error: %r", e)
                 # best-effort flush + ensure at least one assistant message
+                if (c := flush_reasoning()):
+                    yield send_line(f"data: {json.dumps(c)}\n\n")
                 if (c := flush_text()):
                     yield send_line(f"data: {json.dumps(c)}\n\n")
                 if (c := flush_tools()):
