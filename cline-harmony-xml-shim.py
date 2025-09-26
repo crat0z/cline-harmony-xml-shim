@@ -44,6 +44,7 @@ LOG_REASONING = ENV("LOG_REASONING", "0") == "1"
 EXTRACT_TOOLS          = ENV("EXTRACT_TOOLS", "1") == "1"
 TOOL_EXAMPLES          = ENV("TOOL_EXAMPLES", "py")  # none|xml|py
 FORCE_TOOL_CHOICE_NONE = ENV("FORCE_TOOL_CHOICE_NONE", "0") == "1"
+FORCE_TOOL_CALLS       = ENV("FORCE_TOOL_CALLS", "0") == "1"
 TOOL_CHOICE            = ENV("TOOL_CHOICE", "auto")  # auto|none
 
 STRICT_XML             = ENV("STRICT_XML", "1") == "1"      # default strict
@@ -91,6 +92,7 @@ def parse_args():
     p.add_argument("--tool-examples", choices=["none","xml","py"], default=TOOL_EXAMPLES, help="Append short example to tool description")
     p.add_argument("--tool-choice", choices=["auto","none"], default=TOOL_CHOICE, help="Upstream tool_choice override")
     p.add_argument("--force-tool-choice-none", action="store_true", default=FORCE_TOOL_CHOICE_NONE, help="Alias for --tool-choice none")
+    p.add_argument("--force-tool-calls", action="store_true", default=FORCE_TOOL_CALLS, help="Force upstream tool execution (tool_choice='required')")
     p.add_argument("--strict-xml", action="store_true", default=STRICT_XML, help="Unknown tools error out -> synth follow-up")
     p.add_argument("--allow-unknown-as-mcp", action="store_true", default=ALLOW_UNKNOWN_AS_MCP, help="Unknown tools wrap as <use_mcp_tool>")
     p.add_argument("--default-mcp-server", default=DEFAULT_MCP_SERVER, help="Server name used when wrapping unknown tools (opt-in)")
@@ -139,7 +141,7 @@ KNOWN = {
     "read_file","write_to_file","replace_in_file","search_files","list_files",
     "execute_command","list_code_definition_names",
     "ask_followup_question","attempt_completion","new_task","plan_mode_respond","load_mcp_documentation",
-    "use_mcp_tool","access_mcp_resource",
+    "use_mcp_tool","access_mcp_resource","condense",
 }
 
 ALIASES: Dict[str,str] = {
@@ -157,6 +159,14 @@ SAMPLING_KEYS = {
     "temperature","top_p","top_k","min_p","tfs_z","typical_p",
     "presence_penalty","frequency_penalty","mirostat","mirostat_tau","mirostat_eta"
 }
+
+CONDENSE_FALLBACK_USAGE_XML = "<condense>\n<context>Your detailed summary</context>\n<task_progress>task_progress list here</task_progress>\n</condense>"
+CONDENSE_FALLBACK_DESCRIPTION = "Provide a compact conversation summary in <context> and the latest task_progress checklist in <task_progress>."
+CONDENSE_TRIGGER_SNIPPETS = (
+    "<condense>",
+    'type=\"condense\"',
+    "type='condense'",
+)
 
 # ---------- small utils ----------
 def load_custom_aliases(path: str, logger: logging.Logger):
@@ -412,6 +422,61 @@ def detect_mode(messages: List[Dict[str, Any]]) -> str:
             return "ACT"
     return "ACT"
 
+
+def normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def parse_condense_tool(text: str) -> Optional[ToolSpec]:
+    lower = text.lower() if text else ""
+    try:
+        desc_start = lower.index("description:")
+        usage_start = lower.index("usage:")
+    except ValueError:
+        return None
+    params_start = lower.find("parameters:", desc_start)
+    desc_end = params_start if params_start != -1 else usage_start
+    desc_block = text[desc_start + len("Description:"):desc_end].strip()
+    params_block = text[params_start + len("Parameters:"):usage_start].strip() if params_start != -1 else ""
+    usage_block = text[usage_start + len("Usage:"):].strip()
+    usage_match = re.search(r"(?is)(<condense>[\s\S]+)", usage_block)
+    usage_xml = usage_match.group(1).strip() if usage_match else None
+
+    params: List[Tuple[str, bool]] = []
+    for m in re.finditer(r"^\s*-\s*([A-Za-z0-9_]+)\s*:\s*\((required|optional)\)", params_block, re.I | re.M):
+        pname = m.group(1).strip().lower()
+        preq = m.group(2).lower() == "required"
+        params.append((pname, preq))
+    if not params:
+        params = [("context", True), ("task_progress", True)]
+
+    desc = normalize_ws(desc_block)
+    if not desc:
+        desc = CONDENSE_FALLBACK_DESCRIPTION
+    if usage_xml is None:
+        usage_xml = CONDENSE_FALLBACK_USAGE_XML
+
+    return ToolSpec("condense", desc, params, usage_xml)
+
+
+def condense_tool_from_messages(messages: List[Dict[str, Any]]) -> Optional[ToolSpec]:
+    if not messages:
+        return None
+    last = messages[-1]
+    if last.get("role") != "user":
+        return None
+    text = content_to_text(last.get("content"))
+    if not text:
+        return None
+    lowered = text.lower()
+    if not any(snippet in lowered for snippet in CONDENSE_TRIGGER_SNIPPETS):
+        return None
+    spec = parse_condense_tool(text)
+    if spec:
+        return spec
+    return ToolSpec("condense", CONDENSE_FALLBACK_DESCRIPTION, [("context", True), ("task_progress", True)], CONDENSE_FALLBACK_USAGE_XML)
+
+
 # ---------- app ----------
 def create_app(cfg):
     app = FastAPI()
@@ -423,11 +488,18 @@ def create_app(cfg):
     async def upstream_post(payload: Dict[str, Any], ctx: Dict[str, Any], stream: bool = False):
         upstream_body = dict(payload)
 
-        # tool_choice handling
-        if cfg.force_tool_choice_none or cfg.tool_choice == "none":
-            upstream_body["tool_choice"] = "none"
+        # Determine default tool_choice; applied after tool resolution
+        default_tool_choice = None
+        if cfg.force_tool_calls:
+            default_tool_choice = "required"
+        elif cfg.force_tool_choice_none or cfg.tool_choice == "none":
+            default_tool_choice = "none"
         elif cfg.tool_choice == "auto":
-            upstream_body["tool_choice"] = "auto"
+            default_tool_choice = "auto"
+
+        if cfg.force_tool_calls and cfg.force_tool_choice_none and not getattr(cfg, "_logged_force_choice_conflict", False):
+            log.warning("Both --force-tool-calls and --force-tool-choice-none were set; forcing tool_choice='required'.")
+            setattr(cfg, "_logged_force_choice_conflict", True)
 
         # Insert guardrail prompt AFTER Cline system (optional)
         if cfg.guardrail_prompt:
@@ -457,7 +529,15 @@ def create_app(cfg):
 
         if cfg.cache_reuse:
             upstream_body["cache_prompt"] = True
-        
+
+        current_rf_value = upstream_body.get("reasoning_format")
+        current_rf = str(current_rf_value).lower() if current_rf_value is not None else ""
+        if current_rf != "auto":
+            if "reasoning_format" in upstream_body and current_rf and current_rf != "auto" and not getattr(cfg, "_logged_reasoning_override", False):
+                log.warning("Overriding client-provided reasoning_format=%s with 'auto' (required for reasoning_content).", current_rf_value)
+                setattr(cfg, "_logged_reasoning_override", True)
+            upstream_body["reasoning_format"] = "auto"
+
         ctx["effort"] = eff
         ctx["cache_prompt"] = cfg.cache_reuse
 
@@ -467,26 +547,53 @@ def create_app(cfg):
             for k in list(upstream_body.keys()):
                 if k in SAMPLING_KEYS:
                     upstream_body.pop(k, None)
-        # globals
-        eff_sampling.update(dict_from_overrides(cfg.set_sampling))
-        # per-mode (override globals)
+
+        tool_choice_override_warning = False
+
+        def scrub_tool_choice(overrides: Dict[str, Any], label: str) -> Dict[str, Any]:
+            nonlocal tool_choice_override_warning
+            if cfg.force_tool_calls and "tool_choice" in overrides:
+                overrides = dict(overrides)
+                overrides.pop("tool_choice", None)
+                if not tool_choice_override_warning:
+                    log.warning("Ignoring tool_choice from %s because --force-tool-calls is enabled.", label)
+                    tool_choice_override_warning = True
+            return overrides
+
+        general_overrides = scrub_tool_choice(dict_from_overrides(cfg.set_sampling), "--set-sampling")
+        eff_sampling.update(general_overrides)
+
         if mode == "PLAN":
-            eff_sampling.update(dict_from_overrides(cfg.set_sampling_plan))
+            mode_overrides = scrub_tool_choice(dict_from_overrides(cfg.set_sampling_plan), "--set-sampling-plan")
         else:
-            eff_sampling.update(dict_from_overrides(cfg.set_sampling_act))
+            mode_overrides = scrub_tool_choice(dict_from_overrides(cfg.set_sampling_act), "--set-sampling-act")
+        eff_sampling.update(mode_overrides)
+
         upstream_body.update(eff_sampling)
 
         # Extract tools from system prompt
+        condense_spec: Optional[ToolSpec] = None
         tool_specs: Dict[str, ToolSpec] = {}
         if cfg.extract_tools:
             # concat all system messages (Cline sends one big one)
-            sys_texts = [m.get("content","") for m in upstream_body.get("messages",[]) if m.get("role")=="system" and isinstance(m.get("content"), str)]
+            sys_texts = [m.get("content","") for m in upstream_body.get("messages", []) if m.get("role") == "system" and isinstance(m.get("content"), str)]
             if sys_texts:
                 merged = "\n\n".join(sys_texts)
                 tool_specs = parse_tools_from_system(merged)
-                if tool_specs:
-                    tools_arr = [spec.openai_schema(cfg.tool_examples) for spec in tool_specs.values()]
-                    upstream_body["tools"] = tools_arr
+            condense_spec = condense_tool_from_messages(upstream_body.get("messages", []))
+            if condense_spec:
+                tool_specs = {"condense": condense_spec}
+            upstream_body.setdefault("parallel_tool_calls", False)
+            upstream_body.setdefault("parse_tool_calls", True)
+
+        if tool_specs:
+            tools_arr = [spec.openai_schema(cfg.tool_examples) for spec in tool_specs.values()]
+            upstream_body["tools"] = tools_arr
+
+        if condense_spec:
+            upstream_body["tool_choice"] = "required"
+        elif default_tool_choice is not None and "tool_choice" not in upstream_body:
+            upstream_body["tool_choice"] = default_tool_choice
 
         # Grammar (experimental; some servers ignore when --jinja is enabled)
         if cfg.enforce_xml and cfg.enforce_xml != "off":
@@ -840,6 +947,21 @@ def create_app(cfg):
                     except Exception:
                         continue
 
+                    usage_payload = j.get("usage")
+                    if usage_payload:
+                        chunk = {
+                            "id": id_,
+                            "object": "chat.completion.chunk",
+                            "created": j.get("created", int(time.time())),
+                            "model": model,
+                            "choices": [],
+                            "usage": usage_payload,
+                        }
+                        if k := j.get("timings"):
+                            chunk["timings"] = k
+                        yield send_line(f"data: {json.dumps(chunk)}\n\n")
+                        continue
+
                     ch0 = (j.get("choices") or [{}])[0]
                     d = ch0.get("delta") or {}
 
@@ -975,6 +1097,7 @@ if __name__ == "__main__":
         tool_examples = args.tool_examples
         tool_choice = ("none" if args.force_tool_choice_none else args.tool_choice)
         force_tool_choice_none = (args.force_tool_choice_none or args.tool_choice == "none")
+        force_tool_calls = args.force_tool_calls
 
         strict_xml = args.strict_xml
         allow_unknown_as_mcp = args.allow_unknown_as_mcp
@@ -1005,6 +1128,10 @@ if __name__ == "__main__":
         reasoning_effort = args.reasoning_effort
         reasoning_effort_plan = args.reasoning_effort_plan
         reasoning_effort_act = args.reasoning_effort_act
+
+    if Cfg.force_tool_calls and not getattr(Cfg, "_logged_force_tool_reasoning_warning", False):
+        log.warning("--force-tool-calls forces tool_choice='required' and currently suppresses reasoning deltas on upstream llama.cpp. Patch available: https://github.com/crat0z/llama.cpp/tree/gpt-oss-reasoning-tool-call")
+        setattr(Cfg, "_logged_force_tool_reasoning_warning", True)
 
     app = create_app(Cfg)
 

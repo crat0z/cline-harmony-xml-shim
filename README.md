@@ -31,17 +31,16 @@
 * ⚙️ **Sampling sanity**:
 
   * **Strips client sampling by default** (temperature/top\_p/top\_k/etc.)
-  * **Cache reuse ON by default** — sets `cache_prompt=true` upstream
-  * Per-mode overrides + `reasoning_effort=low|medium|high` for llama-server
-
----
-
-## 🏁 GETTING STARTED (THE ACTUAL MEAT, WITH EMOJIS)
+  * **Cache reuse ON** (shim sends `cache_prompt=true`)
+  * **Reasoning format auto** (shim injects `reasoning_format="auto"` so you actually get `reasoning_content`)
+  * **Strip client sampling ON** (ignores client `temperature/top_p/top_k/...`)
+  * **Tool call options locked** (shim sets `parallel_tool_calls=false`, `parse_tool_calls=true` when advertising tools)
+  * `reasoning_effort` is opt-in via flags (see below)
 
 ### 0) **Model + llama.cpp** — Do this first or nothing works, lol
 
-> **You MUST** run `llama-server` with **both** `--jinja` **and** `--reasoning-format auto`.
-> Also: **highly recommend** `--cache-reuse 10240` (models be chunky; reuse that prompt cache 🔥).
+> **You MUST** run `llama-server` with **`--jinja` enabled**. The shim force-feeds `reasoning_format=auto` in every request, so you still get those juicy `reasoning_content` deltas.
+> Also: **highly recommend** `--cache-reuse 256` (models be chunky; reuse that prompt cache 🔥).
 
 **Windows / PowerShell** (adjust paths for your life choices):
 
@@ -50,8 +49,8 @@
 .\llama-server.exe `
   -m "C:\ai\models\gpt-oss-20b-mxfp4.gguf" `
   --host 127.0.0.1 --port 8080 `
-  --jinja --reasoning-format auto `
-  --cache-reuse 10240 `
+  --jinja `
+  --cache-reuse 256 `
   -a gpt-oss-20b
 ```
 
@@ -61,8 +60,8 @@
 ./llama-server \
   -m "/opt/models/gpt-oss-20b-mxfp4.gguf" \
   --host 127.0.0.1 --port 8080 \
-  --jinja --reasoning-format auto \
-  --cache-reuse 10240 \
+  --jinja \
+  --cache-reuse 256 \
   -a gpt-oss-20b
 ```
 
@@ -79,9 +78,10 @@ python ./cline-harmony-xml-shim.py `
 
 * Defaults (spicy and sensible):
 
-  * ✅ **Cache reuse ON** → sends `cache_prompt=true`
-  * ✅ **Strip client sampling ON** → ignores client `temperature/top_p/top_k/...`
-  * 🧠 `reasoning_effort` is opt-in via flags (see below)
+  * **Cache reuse ON** (shim sends `cache_prompt=true`)
+  * **Reasoning format auto** (shim injects `reasoning_format="auto"` so you actually get `reasoning_content`)
+  * **Strip client sampling ON** (ignores client `temperature/top_p/top_k/...`)
+  * `reasoning_effort` is opt-in via flags (see below)
 
 ### 2) **Point Cline at the shim**
 
@@ -122,6 +122,19 @@ python ./cline-harmony-xml-shim.py `
   --set-sampling-act "temperature=0.7" `
   --reasoning-effort-act high
 ```
+
+**Make every turn hit a tool (the compliance switch):**
+
+```powershell
+python ./cline-harmony-xml-shim.py `
+  --host 127.0.0.1 --port 8787 `
+  --upstream http://127.0.0.1:8080 `
+  --force-tool-calls
+```
+
+<sub>Bonus: when the user screams for a condense, the shim shoves a `condense` tool choice upstream automatically.</sub>
+
+> **Heads-up:** On current llama.cpp builds, `--force-tool-calls` disables reasoning deltas. Grab the patched fork: [`llama.cpp:gpt-oss-reasoning-tool-call`](https://github.com/crat0z/llama.cpp/tree/gpt-oss-reasoning-tool-call).
 
 **Flip defaults just this run (you absolute renegade):**
 
@@ -168,7 +181,7 @@ python ./cline-harmony-xml-shim.py ... --no-strip-client-sampling
   `read_file`, `write_to_file`, `replace_in_file`, `search_files`, `list_files`,
   `execute_command`, `list_code_definition_names`,
   `ask_followup_question`, `attempt_completion`, `new_task`, `plan_mode_respond`,
-  `use_mcp_tool`, `access_mcp_resource`
+  `use_mcp_tool`, `access_mcp_resource`, `condense`
 
 * **Aliases** (because YOLO):
 
@@ -237,7 +250,7 @@ python ./cline-harmony-xml-shim.py ... --no-strip-client-sampling
 
 ## 🏁 FINAL BOSS CHECKLIST (DO THESE OR PERISH)
 
-* ✅ `llama-server` running with **`--jinja --reasoning-format auto --cache-reuse 10240`**
+* ✅ `llama-server` running with **`--jinja --cache-reuse 256`**
 * ✅ Shim running on **127.0.0.1:8787** pointing to **[http://127.0.0.1:8080](http://127.0.0.1:8080)**
 * ✅ Cline configured to hit the shim, model name `gpt-oss-20b`
 * ✅ Optional: `--synthesize-empty-xml` for when the model only **thinks** and never **speaks**
